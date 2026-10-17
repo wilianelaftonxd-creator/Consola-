@@ -1,0 +1,453 @@
+name: Compilar APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.4'
+      - name: Crear proyecto
+        run: |
+          mkdir -p app/src/main/java/com/cgi/estudio app/src/main/python app/src/main/assets/ejemplos
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'CGIStudio'
+          include ':app'
+          EOF
+          cat > build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application' version '8.1.4' apply false
+              id 'com.chaquo.python' version '15.0.1' apply false
+          }
+          EOF
+          cat > app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'com.chaquo.python'
+          }
+          android {
+              namespace 'com.cgi.estudio'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.cgi.estudio'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+                  ndk { abiFilters 'armeabi-v7a', 'arm64-v8a' }
+                  python {
+                      version '3.11'
+                      buildPython 'python3.11'
+                      pip { install 'numpy' }
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+          EOF
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="CGI Studio"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.DeviceDefault">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/python/ayudas.py << 'EOF'
+          """Funciones de ayuda para escribir efectos CGI.
+          Reciben y devuelven un frame: numpy uint8 (alto, ancho, 3) en RGB."""
+          import numpy as np
+
+
+          def mezclar(a, b, alfa):
+              alfa = float(np.clip(alfa, 0, 1))
+              return (a.astype(np.float32) * (1 - alfa) + b.astype(np.float32) * alfa).astype(np.uint8)
+
+
+          def tinte(frame, color=(0, 80, 255), fuerza=0.3):
+              capa = np.full_like(frame, color)
+              return mezclar(frame, capa, fuerza)
+
+
+          def brillo(frame, factor=1.5):
+              return np.clip(frame.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+
+
+          def vineta(frame, fuerza=0.6):
+              h, w = frame.shape[:2]
+              yy, xx = np.ogrid[0:h, 0:w]
+              d = np.sqrt(((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2)
+              mascara = 1 - np.clip(d - 0.4, 0, 1) * fuerza
+              return (frame.astype(np.float32) * mascara[..., None]).astype(np.uint8)
+
+
+          def circulo(frame, cx, cy, radio, color=(255, 255, 255), alfa=1.0, suave=0.4):
+              h, w = frame.shape[:2]
+              x0 = max(int(cx - radio * 1.5), 0)
+              x1 = min(int(cx + radio * 1.5) + 1, w)
+              y0 = max(int(cy - radio * 1.5), 0)
+              y1 = min(int(cy + radio * 1.5) + 1, h)
+              if x0 >= x1 or y0 >= y1 or radio <= 0:
+                  return frame
+              yy, xx = np.ogrid[y0:y1, x0:x1]
+              d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+              borde = max(radio * suave, 1.0)
+              m = (np.clip((radio - d) / borde, 0, 1) * alfa)[..., None]
+              zona = frame[y0:y1, x0:x1].astype(np.float32)
+              frame[y0:y1, x0:x1] = (zona * (1 - m) + np.array(color, np.float32) * m).astype(np.uint8)
+              return frame
+
+
+          def resplandor(frame, cx, cy, radio, color=(255, 200, 80), alfa=0.8):
+              return circulo(frame, cx, cy, radio, color, alfa, suave=1.0)
+
+
+          def temblor(frame, fuerza=10, semilla=0):
+              rng = np.random.default_rng(semilla)
+              dx = int(rng.integers(-fuerza, fuerza + 1))
+              dy = int(rng.integers(-fuerza, fuerza + 1))
+              return np.roll(np.roll(frame, dx, axis=1), dy, axis=0)
+
+
+          def glitch(frame, fuerza=0.5, semilla=0):
+              rng = np.random.default_rng(semilla)
+              h, w = frame.shape[:2]
+              out = frame.copy()
+              for _ in range(int(3 + fuerza * 10)):
+                  y = int(rng.integers(0, h))
+                  alto = int(rng.integers(2, max(3, h // 20)))
+                  desp = int(rng.integers(-1, 2) * fuerza * w * 0.1)
+                  out[y:y + alto] = np.roll(out[y:y + alto], desp, axis=1)
+              sep = int(fuerza * 8)
+              out[:, :, 0] = np.roll(out[:, :, 0], sep, axis=1)
+              out[:, :, 2] = np.roll(out[:, :, 2], -sep, axis=1)
+              return out
+
+
+          def ruido(frame, cantidad=15, semilla=0):
+              rng = np.random.default_rng(semilla)
+              r = rng.normal(0, cantidad, frame.shape[:2])[..., None]
+              return np.clip(frame.astype(np.float32) + r, 0, 255).astype(np.uint8)
+
+
+          def suave(t, desde, hasta):
+              if hasta == desde:
+                  return 1.0
+              x = float(np.clip((t - desde) / (hasta - desde), 0, 1))
+              return x * x * (3 - 2 * x)
+          EOF
+          cat > app/src/main/python/motor.py << 'EOF'
+          """Motor CGI: la app le pasa cada frame (YUV I420) y devuelve el frame con CGI."""
+          import os
+          import glob
+          import importlib.util
+          import traceback
+          import numpy as np
+
+          _e = {}
+          _mensajes = []
+
+
+          def _msg(t):
+              _mensajes.append(str(t))
+
+
+          def tomar_mensajes():
+              t = "\n".join(_mensajes)
+              del _mensajes[:]
+              return t
+
+
+          def _cargar(carpeta):
+              efectos = []
+              for ruta in sorted(glob.glob(os.path.join(carpeta, "*.py"))):
+                  nombre = os.path.basename(ruta)
+                  try:
+                      spec = importlib.util.spec_from_file_location("efecto_" + nombre[:-3], ruta)
+                      mod = importlib.util.module_from_spec(spec)
+                      spec.loader.exec_module(mod)
+                      if not hasattr(mod, "efecto"):
+                          _msg("[!] %s: falta la funcion efecto(frame, t, i, info)" % nombre)
+                          continue
+                      efectos.append({
+                          "nombre": nombre,
+                          "mod": mod,
+                          "desde": float(getattr(mod, "DESDE", 0)),
+                          "hasta": float(getattr(mod, "HASTA", 1e12)),
+                          "fallo": False,
+                      })
+                      _msg("[ok] " + nombre)
+                  except Exception:
+                      _msg("[!] Error cargando %s:\n%s" % (nombre, traceback.format_exc()))
+              return efectos
+
+
+          def iniciar(w, h, rotacion, fps, total, carpeta):
+              efectos = _cargar(carpeta)
+              k = (-(int(rotacion) // 90)) % 4
+              if k % 2 == 1:
+                  ow, oh = h, w
+              else:
+                  ow, oh = w, h
+              info = {"ancho": ow, "alto": oh, "fps": float(fps), "total": int(total)}
+              for e in efectos:
+                  if hasattr(e["mod"], "preparar"):
+                      try:
+                          e["mod"].preparar(info)
+                      except Exception:
+                          _msg("[!] preparar() fallo en %s:\n%s" % (e["nombre"], traceback.format_exc()))
+                          e["fallo"] = True
+              _e.update({"w": w, "h": h, "ow": ow, "oh": oh, "k": k, "fps": float(fps),
+                         "info": info, "efectos": efectos})
+              return [ow, oh, len(efectos)]
+
+
+          def procesar(datos, i):
+              w, h, ow, oh, k = _e["w"], _e["h"], _e["ow"], _e["oh"], _e["k"]
+              try:
+                  a = np.frombuffer(datos, dtype=np.uint8)
+              except TypeError:
+                  a = np.array(list(datos), dtype=np.int8).view(np.uint8)
+              n = w * h
+              y = a[:n].reshape(h, w).astype(np.float32)
+              u = a[n:n + n // 4].reshape(h // 2, w // 2).astype(np.float32) - 128.0
+              v = a[n + n // 4:n + n // 2].reshape(h // 2, w // 2).astype(np.float32) - 128.0
+              u = np.repeat(np.repeat(u, 2, axis=0), 2, axis=1)
+              v = np.repeat(np.repeat(v, 2, axis=0), 2, axis=1)
+              y = 1.164 * (y - 16.0)
+              r = y + 1.596 * v
+              g = y - 0.392 * u - 0.813 * v
+              b = y + 2.017 * u
+              rgb = np.clip(np.stack((r, g, b), axis=2), 0, 255).astype(np.uint8)
+              if k:
+                  rgb = np.ascontiguousarray(np.rot90(rgb, k))
+
+              t = i / _e["fps"]
+              frame = rgb
+              for e in _e["efectos"]:
+                  if e["fallo"] or not (e["desde"] <= t <= e["hasta"]):
+                      continue
+                  try:
+                      res = e["mod"].efecto(frame, t, int(i), _e["info"])
+                      if res is not None:
+                          res = np.asarray(res)
+                          if res.shape != (oh, ow, 3):
+                              raise ValueError("devolvio forma %s, se esperaba %s" % (res.shape, (oh, ow, 3)))
+                          frame = res.astype(np.uint8, copy=False)
+                  except Exception:
+                      _msg("[!] %s fallo en el frame %d y se desactiva:\n%s" % (e["nombre"], i, traceback.format_exc()))
+                      e["fallo"] = True
+
+              f = frame.astype(np.float32)
+              R, G, B = f[..., 0], f[..., 1], f[..., 2]
+              Y = 16.0 + 0.257 * R + 0.504 * G + 0.098 * B
+              U = 128.0 - 0.148 * R - 0.291 * G + 0.439 * B
+              V = 128.0 + 0.439 * R - 0.368 * G - 0.071 * B
+              U = U.reshape(oh // 2, 2, ow // 2, 2).mean(axis=(1, 3))
+              V = V.reshape(oh // 2, 2, ow // 2, 2).mean(axis=(1, 3))
+              out = np.concatenate((Y.ravel(), U.ravel(), V.ravel()))
+              return np.clip(out, 0, 255).astype(np.uint8).tobytes()
+          EOF
+          cat > app/src/main/assets/ejemplos/01_ambiente_azul.py << 'EOF'
+          # Look frio y cinematografico, con un flash blanco a los 2 segundos.
+          from ayudas import tinte, vineta, ruido, brillo
+
+          DESDE = 0
+          HASTA = 9999
+
+
+          def efecto(frame, t, i, info):
+              frame = tinte(frame, (20, 60, 160), 0.25)
+              frame = vineta(frame, 0.6)
+              frame = ruido(frame, 8, semilla=i)
+              if 2.0 <= t <= 2.15:
+                  frame = brillo(frame, 2.5)
+              return frame
+          EOF
+          cat > app/src/main/assets/ejemplos/02_bola_de_energia.py << 'EOF'
+          # Bola de energia en el centro entre los segundos 3 y 8.
+          import math
+          from ayudas import circulo, resplandor, temblor, glitch, suave
+
+          DESDE = 3
+          HASTA = 8
+
+
+          def efecto(frame, t, i, info):
+              w, h = info["ancho"], info["alto"]
+              cx, cy = w / 2, h / 2
+              crecer = suave(t, 3, 5)
+              pulso = 1 + 0.1 * math.sin(t * 12)
+              radio = min(w, h) * 0.25 * crecer * pulso
+              frame = resplandor(frame, cx, cy, radio * 2.5, (80, 160, 255), 0.6)
+              frame = circulo(frame, cx, cy, radio, (200, 230, 255), 1.0, 0.5)
+              frame = circulo(frame, cx, cy, radio * 0.4, (255, 255, 255), 1.0, 0.5)
+              if t > 5:
+                  frame = temblor(frame, int(4 + 10 * crecer), semilla=i)
+                  if i % 4 == 0:
+                      frame = glitch(frame, 0.4, semilla=i)
+              return frame
+          EOF
+          cat > app/src/main/java/com/cgi/estudio/Procesador.java << 'EOF'
+          package com.cgi.estudio;
+
+          import android.content.Context;
+          import android.graphics.Rect;
+          import android.media.Image;
+          import android.media.MediaCodec;
+          import android.media.MediaCodecInfo;
+          import android.media.MediaExtractor;
+          import android.media.MediaFormat;
+          import android.media.MediaMuxer;
+          import android.net.Uri;
+          import com.chaquo.python.PyObject;
+          import com.chaquo.python.Python;
+          import java.io.File;
+          import java.nio.ByteBuffer;
+          import java.util.List;
+
+          public class Procesador {
+              public interface Aviso {
+                  void texto(String t);
+                  void progreso(int pct);
+              }
+
+              private static final long ESPERA = 10000;
+              private final Context ctx;
+              private final Uri video;
+              private final String carpeta;
+              private final Aviso aviso;
+              private MediaCodec dec, enc;
+              private MediaMuxer muxer;
+              private MediaExtractor ex, exAudio;
+              private boolean muxIniciado = false;
+              private int pistaV = -1, pistaA = -1, idxAudio = -1;
+              private MediaFormat formatoAudio = null;
+              private int w, h, ow, oh;
+              private final MediaCodec.BufferInfo infoEnc = new MediaCodec.BufferInfo();
+
+              public Procesador(Context ctx, Uri video, String carpeta, Aviso aviso) {
+                  this.ctx = ctx;
+                  this.video = video;
+                  this.carpeta = carpeta;
+                  this.aviso = aviso;
+              }
+
+              private static double leerFps(MediaFormat f) {
+                  try { return f.getInteger(MediaFormat.KEY_FRAME_RATE); } catch (Exception e) { }
+                  try { return f.getFloat(MediaFormat.KEY_FRAME_RATE); } catch (Exception e) { }
+                  return 30;
+              }
+
+              private void avisarMensajes(PyObject motor) {
+                  String m = motor.callAttr("tomar_mensajes").toString();
+                  if (m != null && m.length() > 0) aviso.texto(m);
+              }
+
+              public void ejecutar(File destino) throws Exception {
+                  boolean terminado = false;
+                  try {
+                      ex = new MediaExtractor();
+                      ex.setDataSource(ctx, video, null);
+                      int idxV = -1;
+                      MediaFormat fv = null;
+                      for (int k = 0; k < ex.getTrackCount(); k++) {
+                          MediaFormat f = ex.getTrackFormat(k);
+                          String mime = f.getString(MediaFormat.KEY_MIME);
+                          if (mime == null) continue;
+                          if (mime.startsWith("video/") && idxV < 0) { idxV = k; fv = f; }
+                          else if (mime.startsWith("audio/") && idxAudio < 0) { idxAudio = k; }
+                      }
+                      if (idxV < 0) throw new Exception("El archivo no tiene video");
+
+                      w = fv.getInteger(MediaFormat.KEY_WIDTH) & ~1;
+                      h = fv.getInteger(MediaFormat.KEY_HEIGHT) & ~1;
+                      double fps = leerFps(fv);
+                      if (fps <= 0) fps = 30;
+                      int rot = fv.containsKey(MediaFormat.KEY_ROTATION) ? fv.getInteger(MediaFormat.KEY_ROTATION) : 0;
+                      long total = 0;
+                      if (fv.containsKey(MediaFormat.KEY_DURATION)) {
+                          total = (long) (fv.getLong(MediaFormat.KEY_DURATION) / 1e6 * fps);
+                      }
+
+                      PyObject motor = Python.getInstance().getModule("motor");
+                      List<PyObject> r = motor.callAttr("iniciar", w, h, rot, fps, total, carpeta).asList();
+                      ow = r.get(0).toInt();
+                      oh = r.get(1).toInt();
+                      avisarMensajes(motor);
+                      aviso.texto("Video " + w + "x" + h + " a " + Math.round(fps) + " fps, efectos: " + r.get(2).toInt());
+
+                      if (idxAudio >= 0) {
+                          exAudio = new MediaExtractor();
+                          exAudio.setDataSource(ctx, video, null);
+                          formatoAudio = exAudio.getTrackFormat(idxAudio);
+                          exAudio.selectTrack(idxAudio);
+                      }
+
+                      if (destino.exists()) destino.delete();
+                      muxer = new MediaMuxer(destino.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+
+                      MediaFormat fe = MediaFormat.createVideoFormat("video/avc", ow, oh);
+                      fe.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+                      int bitrate = (int) Math.min(40000000.0, Math.max(2000000.0, ow * (double) oh * fps * 0.12));
+                      fe.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
+                      fe.setInteger(MediaFormat.KEY_FRAME_RATE, (int) Math.round(fps));
+                      fe.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+                      enc = MediaCodec.createEncoderByType("video/avc");
+                      enc.configure(fe, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                      enc.start();
+
+                      ex.selectTrack(idxV);
+                      fv.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+                      dec = MediaCodec.createDecoderByType(fv.getString(MediaFormat.KEY_MIME));
+                      dec.configure(fv, null, null, 0);
+                      dec.start();
+
+                      long i = 0;
+                      boolean entradaFin = false, decFin = false;
+                      MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                      while (!decFin) {
+                          if (!entradaFin) {
+                              int ii = dec.dequeueInputBuffer(ESPERA);
+                              if (ii >= 0) {
+                                  ByteBuffer ib = dec.getInputBuffer(ii);
+                                  int n = ex.readSampleData(ib, 0);
+                                  if (n < 0) {
+                                      dec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                                      entradaFin = true;
+                                  } else {
+                                      dec.queueInputBuffer(ii, 0, n, ex.getSampleTime(), 0);
+                                      ex.advance();
+                                  }
+                              }
+                          }
+                          int o = dec.dequeueOutputBuffer(info, ESPERA);
+                          if (o >= 0) {
+                              boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM)
