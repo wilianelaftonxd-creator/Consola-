@@ -315,7 +315,7 @@ jobs:
                       frame = glitch(frame, 0.4, semilla=i)
               return frame
           EOF
-          cat > app/src/main/java/com/cgi/estudio/Procesador.java << 'EOF'
+                    cat > app/src/main/java/com/cgi/estudio/Procesador.java << 'EOF'
           package com.cgi.estudio;
 
           import android.content.Context;
@@ -372,7 +372,6 @@ jobs:
               }
 
               public void ejecutar(File destino) throws Exception {
-                  boolean terminado = false;
                   try {
                       ex = new MediaExtractor();
                       ex.setDataSource(ctx, video, null);
@@ -450,4 +449,434 @@ jobs:
                           }
                           int o = dec.dequeueOutputBuffer(info, ESPERA);
                           if (o >= 0) {
-                              boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                              boolean eos = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                              if (info.size > 0) {
+                                  Image im = dec.getOutputImage(o);
+                                  if (im == null) throw new IllegalStateException("El decodificador no entrega imagen");
+                                  byte[] src = aI420(im);
+                                  byte[] res = motor.callAttr("procesar", src, i).toJava(byte[].class);
+                                  if (res.length != ow * oh * 3 / 2) throw new IllegalStateException("Tamano de frame incorrecto");
+                                  enviar(res, info.presentationTimeUs);
+                                  i++;
+                                  if (i % 5 == 0) {
+                                      aviso.progreso(total > 0 ? (int) Math.min(99, 100 * i / total) : 0);
+                                      avisarMensajes(motor);
+                                  }
+                              }
+                              dec.releaseOutputBuffer(o, false);
+                              if (eos) decFin = true;
+                          }
+                      }
+                      avisarMensajes(motor);
+
+                      int idx;
+                      while ((idx = enc.dequeueInputBuffer(ESPERA)) < 0) drenar(false);
+                      enc.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                      drenar(true);
+
+                      if (muxIniciado && pistaA >= 0) {
+                          ByteBuffer buf = ByteBuffer.allocate(1 << 20);
+                          MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
+                          while (true) {
+                              buf.clear();
+                              int n = exAudio.readSampleData(buf, 0);
+                              if (n < 0) break;
+                              bi.offset = 0;
+                              bi.size = n;
+                              bi.presentationTimeUs = exAudio.getSampleTime();
+                              bi.flags = (exAudio.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                                      ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                              muxer.writeSampleData(pistaA, buf, bi);
+                              exAudio.advance();
+                          }
+                      }
+                      muxer.stop();
+                      aviso.progreso(100);
+                      aviso.texto(i + " frames procesados");
+                  } finally {
+                      try { if (dec != null) { dec.stop(); } } catch (Exception e) { }
+                      try { if (dec != null) { dec.release(); } } catch (Exception e) { }
+                      try { if (enc != null) { enc.stop(); } } catch (Exception e) { }
+                      try { if (enc != null) { enc.release(); } } catch (Exception e) { }
+                      try { if (muxer != null) { muxer.release(); } } catch (Exception e) { }
+                      try { if (ex != null) { ex.release(); } } catch (Exception e) { }
+                      try { if (exAudio != null) { exAudio.release(); } } catch (Exception e) { }
+                  }
+              }
+
+              private void enviar(byte[] datos, long pts) {
+                  int idx;
+                  while ((idx = enc.dequeueInputBuffer(ESPERA)) < 0) drenar(false);
+                  Image im = enc.getInputImage(idx);
+                  escribir(im, datos);
+                  enc.queueInputBuffer(idx, 0, ow * oh * 3 / 2, pts, 0);
+                  drenar(false);
+              }
+
+              private void iniciarMuxer() {
+                  pistaV = muxer.addTrack(enc.getOutputFormat());
+                  if (formatoAudio != null) {
+                      try {
+                          pistaA = muxer.addTrack(formatoAudio);
+                      } catch (Exception e) {
+                          pistaA = -1;
+                          aviso.texto("Audio no compatible: el video saldra sin sonido");
+                      }
+                  }
+                  muxer.start();
+                  muxIniciado = true;
+              }
+
+              private void drenar(boolean fin) {
+                  while (true) {
+                      int o = enc.dequeueOutputBuffer(infoEnc, fin ? ESPERA : 0);
+                      if (o == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                          if (!fin) return;
+                          continue;
+                      }
+                      if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                          iniciarMuxer();
+                          continue;
+                      }
+                      if (o < 0) continue;
+                      ByteBuffer ob = enc.getOutputBuffer(o);
+                      if ((infoEnc.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) infoEnc.size = 0;
+                      if (infoEnc.size > 0 && muxIniciado) {
+                          ob.position(infoEnc.offset);
+                          ob.limit(infoEnc.offset + infoEnc.size);
+                          muxer.writeSampleData(pistaV, ob, infoEnc);
+                      }
+                      boolean eos = (infoEnc.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+                      enc.releaseOutputBuffer(o, false);
+                      if (eos) return;
+                  }
+              }
+
+              private byte[] aI420(Image im) {
+                  Rect c = im.getCropRect();
+                  int x0 = c.left, y0 = c.top;
+                  int cw = c.width() & ~1, ch = c.height() & ~1;
+                  if (cw != w || ch != h) {
+                      throw new IllegalStateException("Tamano inesperado del decodificador: " + cw + "x" + ch
+                              + " (se esperaba " + w + "x" + h + ")");
+                  }
+                  byte[] out = new byte[w * h * 3 / 2];
+                  Image.Plane[] p = im.getPlanes();
+                  leer(p[0], x0, y0, w, h, out, 0);
+                  leer(p[1], x0 / 2, y0 / 2, w / 2, h / 2, out, w * h);
+                  leer(p[2], x0 / 2, y0 / 2, w / 2, h / 2, out, w * h + (w / 2) * (h / 2));
+                  return out;
+              }
+
+              private static void leer(Image.Plane p, int x0, int y0, int pw, int ph, byte[] dst, int off) {
+                  ByteBuffer b = p.getBuffer();
+                  int rs = p.getRowStride(), ps = p.getPixelStride();
+                  for (int y = 0; y < ph; y++) {
+                      if (ps == 1) {
+                          b.position((y0 + y) * rs + x0);
+                          b.get(dst, off + y * pw, pw);
+                      } else {
+                          int base = (y0 + y) * rs + x0 * ps;
+                          for (int x = 0; x < pw; x++) dst[off + y * pw + x] = b.get(base + x * ps);
+                      }
+                  }
+              }
+
+              private void escribir(Image im, byte[] src) {
+                  Image.Plane[] p = im.getPlanes();
+                  poner(p[0], ow, oh, src, 0);
+                  poner(p[1], ow / 2, oh / 2, src, ow * oh);
+                  poner(p[2], ow / 2, oh / 2, src, ow * oh + (ow / 2) * (oh / 2));
+              }
+
+              private static void poner(Image.Plane p, int pw, int ph, byte[] src, int off) {
+                  ByteBuffer b = p.getBuffer();
+                  int rs = p.getRowStride(), ps = p.getPixelStride();
+                  for (int y = 0; y < ph; y++) {
+                      if (ps == 1) {
+                          b.position(y * rs);
+                          b.put(src, off + y * pw, pw);
+                      } else {
+                          int base = y * rs;
+                          for (int x = 0; x < pw; x++) b.put(base + x * ps, src[off + y * pw + x]);
+                      }
+                  }
+              }
+          }
+          EOF
+                    cat > app/src/main/java/com/cgi/estudio/MainActivity.java << 'EOF'
+          package com.cgi.estudio;
+
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.database.Cursor;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.DocumentsContract;
+          import android.provider.MediaStore;
+          import android.provider.OpenableColumns;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import com.chaquo.python.Python;
+          import com.chaquo.python.android.AndroidPlatform;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+              static final int REQ_VIDEOS = 1, REQ_CARPETA = 2;
+              final List<Uri> videos = new ArrayList<>();
+              Uri carpetaCodigo = null;
+              TextView txtVideos, txtCarpeta, txtLog;
+              ProgressBar barra;
+              Button btnProcesar;
+              ScrollView scroll;
+              volatile boolean ocupado = false;
+              SharedPreferences prefs;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  if (!Python.isStarted()) Python.start(new AndroidPlatform(this));
+                  prefs = getSharedPreferences("cgi", MODE_PRIVATE);
+                  String guardada = prefs.getString("carpeta", null);
+                  if (guardada != null) carpetaCodigo = Uri.parse(guardada);
+                  copiarEjemplos();
+
+                  LinearLayout raiz = new LinearLayout(this);
+                  raiz.setOrientation(LinearLayout.VERTICAL);
+                  raiz.setBackgroundColor(Color.BLACK);
+                  raiz.setPadding(40, 80, 40, 40);
+
+                  TextView titulo = texto("CGI Studio", Color.GREEN, 28);
+                  Button btnVideos = boton("1. ELEGIR VIDEOS");
+                  txtVideos = texto("Ningún video elegido", Color.LTGRAY, 14);
+                  Button btnCarpeta = boton("2. ELEGIR CARPETA DE CÓDIGO CGI (opcional)");
+                  txtCarpeta = texto("", Color.LTGRAY, 14);
+                  btnProcesar = boton("3. PROCESAR");
+                  barra = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  barra.setMax(100);
+                  txtLog = texto("", Color.WHITE, 12);
+                  scroll = new ScrollView(this);
+                  scroll.addView(txtLog);
+
+                  raiz.addView(titulo);
+                  raiz.addView(btnVideos);
+                  raiz.addView(txtVideos);
+                  raiz.addView(btnCarpeta);
+                  raiz.addView(txtCarpeta);
+                  raiz.addView(btnProcesar);
+                  raiz.addView(barra);
+                  raiz.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+                  setContentView(raiz);
+                  actualizarCarpeta();
+
+                  btnVideos.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                      i.addCategory(Intent.CATEGORY_OPENABLE);
+                      i.setType("video/*");
+                      i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                      startActivityForResult(i, REQ_VIDEOS);
+                  });
+                  btnCarpeta.setOnClickListener(v -> {
+                      Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                      i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                      startActivityForResult(i, REQ_CARPETA);
+                  });
+                  btnProcesar.setOnClickListener(v -> procesar());
+              }
+
+              TextView texto(String t, int color, int size) {
+                  TextView tv = new TextView(this);
+                  tv.setText(t);
+                  tv.setTextColor(color);
+                  tv.setTextSize(size);
+                  tv.setPadding(0, 12, 0, 12);
+                  return tv;
+              }
+
+              Button boton(String t) {
+                  Button bt = new Button(this);
+                  bt.setText(t);
+                  return bt;
+              }
+
+              void actualizarCarpeta() {
+                  txtCarpeta.setText(carpetaCodigo == null
+                          ? "Usando los 2 ejemplos incluidos"
+                          : "Carpeta: " + Uri.decode(carpetaCodigo.getLastPathSegment()));
+              }
+
+              void log(String t) {
+                  runOnUiThread(() -> {
+                      txtLog.append(t + "\n");
+                      scroll.post(() -> scroll.fullScroll(ScrollView.FOCUS_DOWN));
+                  });
+              }
+
+              String nombreDe(Uri u) {
+                  try (Cursor c = getContentResolver().query(u, null, null, null, null)) {
+                      if (c != null && c.moveToFirst()) {
+                          int k = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                          if (k >= 0) return c.getString(k);
+                      }
+                  } catch (Exception e) { }
+                  return "video";
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (res != RESULT_OK || data == null) return;
+                  if (req == REQ_VIDEOS) {
+                      videos.clear();
+                      if (data.getClipData() != null) {
+                          for (int i = 0; i < data.getClipData().getItemCount(); i++) {
+                              videos.add(data.getClipData().getItemAt(i).getUri());
+                          }
+                      } else if (data.getData() != null) {
+                          videos.add(data.getData());
+                      }
+                      StringBuilder sb = new StringBuilder(videos.size() + " video(s): ");
+                      for (Uri u : videos) sb.append(nombreDe(u)).append("  ");
+                      txtVideos.setText(sb.toString());
+                  } else if (req == REQ_CARPETA) {
+                      Uri u = data.getData();
+                      try {
+                          getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      } catch (Exception e) { }
+                      carpetaCodigo = u;
+                      prefs.edit().putString("carpeta", u.toString()).apply();
+                      actualizarCarpeta();
+                  }
+              }
+
+              void copiarEjemplos() {
+                  try {
+                      File dir = new File(getFilesDir(), "ejemplos");
+                      dir.mkdirs();
+                      String[] lista = getAssets().list("ejemplos");
+                      if (lista == null) return;
+                      for (String n : lista) {
+                          try (InputStream in = getAssets().open("ejemplos/" + n);
+                               OutputStream out = new FileOutputStream(new File(dir, n))) {
+                              copiar(in, out);
+                          }
+                      }
+                  } catch (Exception e) {
+                      log("No se pudieron copiar los ejemplos: " + e);
+                  }
+              }
+
+              static void copiar(InputStream in, OutputStream out) throws Exception {
+                  byte[] buf = new byte[65536];
+                  int n;
+                  while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+              }
+
+              String prepararCarpeta() {
+                  File demo = new File(getFilesDir(), "ejemplos");
+                  if (carpetaCodigo == null) return demo.getAbsolutePath();
+                  File dir = new File(getFilesDir(), "efectos_usuario");
+                  dir.mkdirs();
+                  File[] viejos = dir.listFiles();
+                  if (viejos != null) for (File f : viejos) f.delete();
+                  int copiados = 0;
+                  try {
+                      Uri hijos = DocumentsContract.buildChildDocumentsUriUsingTree(carpetaCodigo,
+                              DocumentsContract.getTreeDocumentId(carpetaCodigo));
+                      try (Cursor c = getContentResolver().query(hijos,
+                              new String[]{DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                                      DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
+                          while (c != null && c.moveToNext()) {
+                              String nombre = c.getString(1);
+                              if (nombre == null || !nombre.endsWith(".py")) continue;
+                              Uri doc = DocumentsContract.buildDocumentUriUsingTree(carpetaCodigo, c.getString(0));
+                              try (InputStream in = getContentResolver().openInputStream(doc);
+                                   OutputStream out = new FileOutputStream(new File(dir, nombre))) {
+                                  copiar(in, out);
+                                  copiados++;
+                              }
+                          }
+                      }
+                  } catch (Exception e) {
+                      log("Error leyendo la carpeta de código: " + e);
+                  }
+                  if (copiados == 0) {
+                      log("No encontré archivos .py en la carpeta elegida; uso los ejemplos.");
+                      return demo.getAbsolutePath();
+                  }
+                  return dir.getAbsolutePath();
+              }
+
+              void procesar() {
+                  if (ocupado) return;
+                  if (videos.isEmpty()) {
+                      Toast.makeText(this, "Elige al menos un video", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  ocupado = true;
+                  btnProcesar.setEnabled(false);
+                  final String carpeta = prepararCarpeta();
+                  final List<Uri> lista = new ArrayList<>(videos);
+                  new Thread(() -> {
+                      try {
+                          for (Uri u : lista) {
+                              String nombre = nombreDe(u);
+                              log("\n>> " + nombre);
+                              runOnUiThread(() -> barra.setProgress(0));
+                              File tmp = new File(getCacheDir(), "tmp_cgi.mp4");
+                              try {
+                                  new Procesador(this, u, carpeta, new Procesador.Aviso() {
+                                      public void texto(String t) { log(t); }
+                                      public void progreso(int p) { runOnUiThread(() -> barra.setProgress(p)); }
+                                  }).ejecutar(tmp);
+                                  String base = nombre.contains(".") ? nombre.substring(0, nombre.lastIndexOf('.')) : nombre;
+                                  guardar(tmp, base + "_cgi.mp4");
+                                  log("Listo: Películas/CGI/" + base + "_cgi.mp4");
+                              } catch (Throwable e) {
+                                  log("ERROR: " + e);
+                              } finally {
+                                  tmp.delete();
+                              }
+                          }
+                      } finally {
+                          ocupado = false;
+                          runOnUiThread(() -> btnProcesar.setEnabled(true));
+                      }
+                  }).start();
+              }
+
+              void guardar(File f, String nombre) throws Exception {
+                  ContentValues v = new ContentValues();
+                  v.put(MediaStore.Video.Media.DISPLAY_NAME, nombre);
+                  v.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+                  v.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/CGI");
+                  Uri u = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
+                  try (OutputStream out = getContentResolver().openOutputStream(u);
+                       InputStream in = new FileInputStream(f)) {
+                      copiar(in, out);
+                  }
+              }
+          }
+          EOF
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cgi-studio
+          path: app/build/outputs/apk/debug/app-debug.apk
